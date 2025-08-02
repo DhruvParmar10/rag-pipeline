@@ -1,5 +1,5 @@
 from pydantic import BaseModel, HttpUrl, Field, ConfigDict
-from typing import List, Optional, Dict, Any
+from typing import List, Dict, Any
 from enum import Enum
 
 class DocumentType(str, Enum):
