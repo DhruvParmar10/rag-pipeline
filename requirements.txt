@@ -18,3 +18,5 @@ redis==5.0.1
 python-dotenv==1.0.0
 loguru==0.7.2
 tenacity==8.2.3
+setuptools
+wheel
