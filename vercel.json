@@ -5,7 +5,5 @@
       "dest": "main.py"
     }
   ],
-  "env": {
-    "PYTHON_VERSION": "3.9.6"
-  }
+  "runtime": "python3.9"
 }
