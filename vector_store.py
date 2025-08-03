@@ -131,11 +131,14 @@ class VectorStore:
         self, 
         query_embedding: List[float], 
         document_url: Optional[str] = None,
-        top_k: int = None
+        top_k: int = None,
+        threshold: float = None
     ) -> List[SearchResult]:
-        """Search for similar chunks using vector similarity"""
+        """Enhanced search for similar chunks using vector similarity"""
         if top_k is None:
             top_k = settings.top_k_chunks
+        if threshold is None:
+            threshold = settings.similarity_threshold
         
         try:
             # Create filter for specific document if provided
@@ -150,6 +153,9 @@ class VectorStore:
                     ]
                 )
             
+            # Search with a higher limit initially to allow for better filtering
+            search_limit = min(top_k * 2, 100)
+            
             # Perform vector search - run in executor for non-blocking
             loop = asyncio.get_event_loop()
             search_results = await loop.run_in_executor(
@@ -158,28 +164,38 @@ class VectorStore:
                     collection_name=self.collection_name,
                     query_vector=query_embedding,
                     query_filter=query_filter,
-                    limit=top_k,
-                    score_threshold=settings.similarity_threshold
+                    limit=search_limit,
+                    score_threshold=threshold * 0.8,  # More permissive threshold initially
+                    with_payload=True
                 )
             )
             
-            # Convert to SearchResult objects
+            # Convert to SearchResult objects and apply final filtering
             results = []
             for result in search_results:
-                search_result = SearchResult(
-                    chunk_id=result.payload["chunk_id"],
-                    content=result.payload["content"],
-                    score=result.score,
-                    metadata=result.payload.get("metadata", {})
-                )
-                results.append(search_result)
+                if result.score >= threshold or len(results) < top_k // 2:  # Ensure minimum results
+                    search_result = SearchResult(
+                        chunk_id=result.payload["chunk_id"],
+                        content=result.payload["content"],
+                        score=result.score,
+                        metadata={
+                            **result.payload.get("metadata", {}),
+                            "document_url": result.payload.get("document_url"),
+                            "chunk_index": result.payload.get("chunk_index")
+                        }
+                    )
+                    results.append(search_result)
             
-            logger.info(f"Found {len(results)} similar chunks with threshold {settings.similarity_threshold}")
-            return results
+            # Sort by score and limit results
+            results.sort(key=lambda x: x.score, reverse=True)
+            final_results = results[:top_k]
+            
+            logger.info(f"Enhanced search found {len(final_results)} chunks (threshold: {threshold:.3f})")
+            return final_results
             
         except Exception as e:
             logger.error(f"Failed to search similar chunks: {e}")
-            raise
+            return []
 
     async def delete_document_chunks(self, document_url: str) -> int:
         """Delete all chunks for a specific document"""
@@ -224,21 +240,47 @@ class VectorStore:
     async def get_collection_info(self) -> Dict[str, Any]:
         """Get information about the collection"""
         try:
+            # Use a simpler approach to avoid validation issues
             loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(
+            
+            # Get basic collection count first
+            count_info = await loop.run_in_executor(
                 None,
-                lambda: self.client.get_collection(self.collection_name)
+                lambda: self.client.count(self.collection_name)
             )
-            return {
+            
+            result = {
                 "collection_name": self.collection_name,
-                "points_count": info.points_count,
-                "vectors_count": info.vectors_count,
-                "status": info.status,
-                "optimizer_status": info.optimizer_status
+                "points_count": count_info.count if hasattr(count_info, 'count') else 0,
+                "status": "available"
             }
+            
+            # Try to get additional info if possible
+            try:
+                collections = await loop.run_in_executor(
+                    None,
+                    lambda: self.client.get_collections()
+                )
+                
+                # Find our collection in the list
+                for collection in collections.collections:
+                    if collection.name == self.collection_name:
+                        result["vector_size"] = getattr(collection, 'vectors_count', 'N/A')
+                        break
+                        
+            except Exception as detail_error:
+                logger.warning(f"Could not get detailed collection info: {detail_error}")
+                # Continue with basic info
+                
+            return result
+            
         except Exception as e:
             logger.error(f"Failed to get collection info: {e}")
-            return {"error": str(e)}
+            return {
+                "collection_name": self.collection_name,
+                "error": str(e),
+                "status": "unknown"
+            }
 
     async def health_check(self) -> bool:
         """Check if Qdrant is healthy and responsive"""

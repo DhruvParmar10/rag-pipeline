@@ -52,6 +52,7 @@ logs/
 app.log
 
 # Local environment variables (keep .env.example if you have one)
+.env
 .env.local
 .env.development.local
 .env.test.local

@@ -83,32 +83,27 @@ class RAGPipeline:
             raise
 
     async def _answer_questions(self, document_url: str, questions: List[str]) -> List[str]:
-        """Answer questions using RAG approach"""
+        """Answer questions using enhanced RAG approach"""
         answers = []
+        document_hash = self._get_document_hash(document_url)
         
         for i, question in enumerate(questions):
             try:
                 logger.info(f"Processing question {i+1}/{len(questions)}: {question[:100]}...")
                 
-                # Step 1: Generate question embedding
-                question_embedding = await self.embedding_service.generate_embedding(question)
-                
-                # Step 2: Retrieve relevant chunks
-                search_results = await self.vector_store.search_similar_chunks(
-                    query_embedding=question_embedding,
-                    document_url=document_url
-                )
+                # Enhanced retrieval with multiple strategies
+                search_results = await self._enhanced_retrieval(question, document_hash)
                 
                 if not search_results:
                     logger.warning(f"No relevant chunks found for question: {question}")
-                    answers.append("I could not find relevant information in the document to answer this question.")
+                    answers.append("The document does not contain information to answer this question.")
                     continue
                 
-                # Step 3: Prepare context from retrieved chunks
-                context = self._prepare_context(search_results, question)
+                # Step 3: Prepare enhanced context from retrieved chunks
+                context = self._prepare_enhanced_context(search_results, question)
                 
-                # Step 4: Generate answer using context
-                answer = await self.generative_model.generate_answer(question, context)
+                # Step 4: Generate answer using enhanced context
+                answer = await self.generative_model.generate_enhanced_answer(question, context)
                 answers.append(answer)
                 
                 logger.info(f"Question {i+1} answered successfully")
@@ -119,38 +114,129 @@ class RAGPipeline:
         
         return answers
 
-    def _prepare_context(self, search_results: List[SearchResult], question: str) -> str:
-        """Prepare context from search results for answer generation"""
+    async def _enhanced_retrieval(self, question: str, document_hash: str) -> List[SearchResult]:
+        """Enhanced retrieval using multiple strategies"""
+        try:
+            # Strategy 1: Direct semantic search
+            question_embedding = await self.embedding_service.generate_embedding(question)
+            primary_results = await self.vector_store.search_similar_chunks(
+                query_embedding=question_embedding,
+                document_url=None,  # Search across all documents first
+                top_k=settings.top_k_chunks
+            )
+            
+            # Filter by document hash if we have it
+            filtered_results = []
+            for result in primary_results:
+                result_hash = self._get_document_hash(result.metadata.get('document_url', ''))
+                if result_hash == document_hash:
+                    filtered_results.append(result)
+            
+            # Strategy 2: Keyword-based fallback if semantic search yields few results
+            if len(filtered_results) < settings.top_k_chunks // 2:
+                keyword_results = await self._keyword_search(question, document_hash)
+                # Merge and deduplicate
+                all_results = filtered_results + keyword_results
+                filtered_results = self._deduplicate_results(all_results)
+            
+            # Strategy 3: Relaxed threshold search if still not enough results
+            if len(filtered_results) < 3:
+                relaxed_results = await self.vector_store.search_similar_chunks(
+                    query_embedding=question_embedding,
+                    document_url=None,
+                    top_k=settings.top_k_chunks * 2,
+                    threshold=settings.similarity_threshold * 0.7  # More relaxed
+                )
+                # Filter and merge
+                for result in relaxed_results:
+                    result_hash = self._get_document_hash(result.metadata.get('document_url', ''))
+                    if result_hash == document_hash and result not in filtered_results:
+                        filtered_results.append(result)
+            
+            # Sort by relevance and return top results
+            filtered_results.sort(key=lambda x: x.score, reverse=True)
+            return filtered_results[:settings.top_k_chunks]
+            
+        except Exception as e:
+            logger.error(f"Enhanced retrieval failed: {e}")
+            return []
+
+    async def _keyword_search(self, question: str, document_hash: str) -> List[SearchResult]:
+        """Keyword-based search as fallback"""
+        # Extract keywords from question
+        keywords = self._extract_keywords(question)
+        
+        # Create a keyword-based query
+        keyword_query = " ".join(keywords)
+        if keyword_query.strip():
+            keyword_embedding = await self.embedding_service.generate_embedding(keyword_query)
+            return await self.vector_store.search_similar_chunks(
+                query_embedding=keyword_embedding,
+                document_url=None,
+                top_k=settings.top_k_chunks // 2,
+                threshold=settings.similarity_threshold * 0.8
+            )
+        return []
+
+    def _extract_keywords(self, text: str) -> List[str]:
+        """Extract important keywords from question"""
+        import re
+        
+        # Remove common question words and short words
+        stop_words = {
+            'what', 'is', 'are', 'how', 'when', 'where', 'why', 'does', 'do', 'can', 
+            'will', 'would', 'should', 'could', 'the', 'a', 'an', 'and', 'or', 'but', 
+            'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'under', 'this', 'that'
+        }
+        
+        words = re.findall(r'\b\w+\b', text.lower())
+        keywords = [word for word in words if word not in stop_words and len(word) > 2]
+        
+        return keywords[:5]  # Top 5 keywords
+
+    def _deduplicate_results(self, results: List[SearchResult]) -> List[SearchResult]:
+        """Remove duplicate search results"""
+        seen_content = set()
+        unique_results = []
+        
+        for result in results:
+            # Use first 100 characters as uniqueness key
+            content_key = result.content[:100].strip()
+            if content_key not in seen_content:
+                seen_content.add(content_key)
+                unique_results.append(result)
+        
+        return unique_results
+
+    def _prepare_enhanced_context(self, search_results: List[SearchResult], question: str) -> str:
+        """Prepare enhanced context with better formatting and relevance scoring"""
         if not search_results:
             return ""
         
         # Sort by relevance score
         sorted_results = sorted(search_results, key=lambda x: x.score, reverse=True)
         
-        # Combine context from top results
+        # Build context with numbered sections and relevance scores
         context_parts = []
         total_chars = 0
         max_context_chars = settings.context_window
         
-        for result in sorted_results:
+        for i, result in enumerate(sorted_results, 1):
             chunk_content = result.content.strip()
             
             # Skip if adding this chunk would exceed context window
             if total_chars + len(chunk_content) > max_context_chars:
-                # Try to add partial content if possible
-                remaining_chars = max_context_chars - total_chars
-                if remaining_chars > 100:  # Only add if meaningful portion can be included
-                    partial_content = chunk_content[:remaining_chars].rsplit(' ', 1)[0]
-                    context_parts.append(partial_content)
                 break
             
-            context_parts.append(chunk_content)
-            total_chars += len(chunk_content)
+            # Format with relevance information
+            formatted_chunk = f"[Source {i} - Relevance: {result.score:.3f}]\n{chunk_content}"
+            context_parts.append(formatted_chunk)
+            total_chars += len(formatted_chunk) + 20  # Account for formatting
         
         # Join context parts with clear separators
-        context = "\n\n---\n\n".join(context_parts)
+        context = "\n\n" + "="*50 + "\n\n".join([""] + context_parts) + "\n" + "="*50 + "\n"
         
-        logger.info(f"Prepared context with {len(context_parts)} chunks, {total_chars} characters")
+        logger.info(f"Enhanced context prepared: {len(context_parts)} chunks, {total_chars} characters")
         return context
 
     def _get_document_hash(self, document_url: str) -> str:

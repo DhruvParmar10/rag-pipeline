@@ -162,30 +162,131 @@ class GenerativeModel:
         
         logger.info(f"Initialized GenerativeModel with {'OpenRouter API' if self.use_openrouter else 'local model'}")
 
-    async def generate_answer(self, question: str, context: str) -> str:
-        """Generate answer based on question and context"""
+    async def generate_enhanced_answer(self, question: str, context: str) -> str:
+        """Generate enhanced answer with better prompting and handling"""
         if not question.strip():
             raise ValueError("Question cannot be empty")
         
         if not context.strip():
-            return "I cannot provide an answer as no relevant context was found in the document."
+            return "The document does not contain information to answer this question."
         
-        # Create prompt
-        prompt = self._create_prompt(question, context)
+        # Create enhanced prompt
+        prompt = self._create_enhanced_prompt(question, context)
         
         try:
             if self.use_openrouter:
-                answer = await self._generate_with_openrouter(prompt)
+                answer = await self._generate_with_openrouter_enhanced(prompt)
             else:
                 answer = await self._generate_with_local_model(prompt)
             
             # Clean and validate answer
-            cleaned_answer = self._clean_answer(answer)
+            cleaned_answer = self._clean_and_validate_answer(answer, question)
             return cleaned_answer
             
         except Exception as e:
-            logger.error(f"Failed to generate answer: {e}")
+            logger.error(f"Failed to generate enhanced answer: {e}")
             return "I apologize, but I encountered an error while generating the answer."
+
+    def _create_enhanced_prompt(self, question: str, context: str) -> str:
+        """Create an enhanced prompt for better answer generation"""
+        prompt = f"""You are an expert document analyst. Your task is to answer questions based STRICTLY on the provided context from a document.
+
+INSTRUCTIONS:
+1. Read the context carefully and identify relevant information
+2. Answer the question using ONLY information explicitly stated in the context
+3. If specific details are mentioned, include them in your answer
+4. Quote exact phrases when they directly answer the question
+5. Keep answers concise but complete (2-4 sentences maximum)
+6. If the context doesn't contain the answer, respond: "The document does not contain information to answer this question."
+
+CONTEXT FROM DOCUMENT:
+{context}
+
+QUESTION: {question}
+
+Based on the context provided above, provide a precise and factual answer:"""
+        return prompt
+
+    async def _generate_with_openrouter_enhanced(self, prompt: str) -> str:
+        """Enhanced generation using OpenRouter API with optimized parameters"""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/yourusername/rag-pipeline",
+            "X-Title": "RAG PDF QA Pipeline"
+        }
+        
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a precise document analyst that provides accurate, concise answers based strictly on document context. Never add external information."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "max_tokens": 300,  # Increased slightly for more complete answers
+            "temperature": 0.1,  # Very low for factual responses
+            "top_p": 0.9,
+            "frequency_penalty": 0.1,  # Slight penalty to avoid repetition
+            "presence_penalty": 0.1,   # Encourage focused responses
+            "stream": False
+        }
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            if "choices" in result and len(result["choices"]) > 0:
+                return result["choices"][0]["message"]["content"]
+            else:
+                raise ValueError("No response generated from OpenRouter API")
+
+    def _clean_and_validate_answer(self, answer: str, question: str) -> str:
+        """Clean and validate the generated answer"""
+        if not answer or not answer.strip():
+            return "The document does not contain information to answer this question."
+        
+        # Clean the answer
+        cleaned = answer.strip()
+        
+        # Remove any unwanted prefixes that the model might add
+        unwanted_prefixes = [
+            "Based on the context,", "According to the document,", 
+            "The document states that", "From the context provided,",
+            "Answer:", "Response:"
+        ]
+        
+        for prefix in unwanted_prefixes:
+            if cleaned.lower().startswith(prefix.lower()):
+                cleaned = cleaned[len(prefix):].strip()
+        
+        # Ensure the answer isn't just repeating the question
+        if cleaned.lower() == question.lower():
+            return "The document does not contain information to answer this question."
+        
+        # Ensure reasonable length
+        if len(cleaned) < 10:
+            return "The document does not contain sufficient information to answer this question."
+        
+        # Limit length if too long
+        if len(cleaned) > 800:
+            sentences = cleaned.split('. ')
+            truncated = '. '.join(sentences[:3])
+            if not truncated.endswith('.'):
+                truncated += '.'
+            cleaned = truncated
+        
+        return cleaned
 
     async def _generate_with_openrouter(self, prompt: str) -> str:
         """Generate answer using OpenRouter API"""

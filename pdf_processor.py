@@ -167,21 +167,27 @@ class TextChunker:
         self.overlap_size = int(self.chunk_size * self.overlap_ratio)
 
     def create_chunks(self, text: str, document_url: str) -> List[DocumentChunk]:
-        """Create overlapping chunks with metadata"""
+        """Create enhanced overlapping chunks with better semantic boundaries"""
         if not text.strip():
             raise ValueError("Cannot create chunks from empty text")
         
-        # Split into sentences for better semantic boundaries
-        sentences = self._split_into_sentences(text)
+        # Enhanced preprocessing
+        text = self._preprocess_for_chunking(text)
+        
+        # Split into sentences with better boundary detection
+        sentences = self._smart_sentence_split(text)
         chunks = []
         current_chunk = ""
         current_start = 0
         chunk_index = 0
         
-        for sentence in sentences:
+        i = 0
+        while i < len(sentences):
+            sentence = sentences[i]
+            
             # Check if adding this sentence would exceed chunk size
             if len(current_chunk) + len(sentence) > self.chunk_size and current_chunk:
-                # Create chunk
+                # Create chunk with enhanced metadata
                 chunk_id = self._generate_chunk_id(document_url, chunk_index)
                 chunk = DocumentChunk(
                     chunk_id=chunk_id,
@@ -192,23 +198,28 @@ class TextChunker:
                     metadata={
                         "document_url": document_url,
                         "total_chars": len(current_chunk),
-                        "word_count": len(current_chunk.split())
+                        "word_count": len(current_chunk.split()),
+                        "sentence_count": len([s for s in current_chunk.split('.') if s.strip()]),
+                        "chunk_type": self._classify_chunk_content(current_chunk)
                     }
                 )
                 chunks.append(chunk)
                 
-                # Prepare next chunk with overlap
-                overlap_text = self._get_overlap_text(current_chunk)
-                current_chunk = overlap_text + " " + sentence
-                current_start = current_start + len(current_chunk) - len(overlap_text)
+                # Prepare next chunk with smart overlap
+                overlap_content = self._get_smart_overlap(current_chunk)
+                current_chunk = overlap_content + " " + sentence
+                current_start += len(chunk.content) - len(overlap_content)
                 chunk_index += 1
             else:
+                # Add sentence to current chunk
                 if current_chunk:
                     current_chunk += " " + sentence
                 else:
                     current_chunk = sentence
+            
+            i += 1
         
-        # Add final chunk if there's remaining text
+        # Add the last chunk if it has content
         if current_chunk.strip():
             chunk_id = self._generate_chunk_id(document_url, chunk_index)
             chunk = DocumentChunk(
@@ -220,13 +231,84 @@ class TextChunker:
                 metadata={
                     "document_url": document_url,
                     "total_chars": len(current_chunk),
-                    "word_count": len(current_chunk.split())
+                    "word_count": len(current_chunk.split()),
+                    "sentence_count": len([s for s in current_chunk.split('.') if s.strip()]),
+                    "chunk_type": self._classify_chunk_content(current_chunk)
                 }
             )
             chunks.append(chunk)
         
-        logger.info(f"Created {len(chunks)} chunks from document")
+        logger.info(f"Created {len(chunks)} enhanced chunks from document")
         return chunks
+
+    def _preprocess_for_chunking(self, text: str) -> str:
+        """Enhanced preprocessing for better chunking"""
+        # Fix common spacing issues around punctuation
+        text = re.sub(r'\s*\.\s*', '. ', text)
+        text = re.sub(r'\s*\?\s*', '? ', text)
+        text = re.sub(r'\s*!\s*', '! ', text)
+        text = re.sub(r'\s*:\s*', ': ', text)
+        text = re.sub(r'\s*;\s*', '; ', text)
+        
+        # Fix paragraph breaks
+        text = re.sub(r'\n\s*\n', '\n\n', text)
+        
+        # Normalize whitespace
+        text = re.sub(r' +', ' ', text)
+        
+        return text.strip()
+
+    def _smart_sentence_split(self, text: str) -> List[str]:
+        """Enhanced sentence splitting with better boundary detection"""
+        # Basic sentence split
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        # Filter out very short "sentences" that are likely fragments
+        filtered_sentences = []
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) > 10 and not re.match(r'^\d+\.?\s*$', sentence):  # Skip lone numbers
+                filtered_sentences.append(sentence)
+        
+        return filtered_sentences
+
+    def _get_smart_overlap(self, chunk_content: str) -> str:
+        """Get intelligent overlap content focusing on complete sentences"""
+        if not chunk_content or len(chunk_content) <= self.overlap_size:
+            return chunk_content
+        
+        # Try to get overlap that ends with a complete sentence
+        overlap_text = chunk_content[-self.overlap_size:]
+        
+        # Find the last complete sentence in the overlap
+        last_period = overlap_text.rfind('.')
+        last_question = overlap_text.rfind('?')
+        last_exclamation = overlap_text.rfind('!')
+        
+        last_sentence_end = max(last_period, last_question, last_exclamation)
+        
+        if last_sentence_end > self.overlap_size * 0.5:  # If we can keep at least half the overlap
+            return overlap_text[:last_sentence_end + 1].strip()
+        else:
+            # Fallback to word boundary
+            words = overlap_text.split()
+            return ' '.join(words[:len(words)//2])
+
+    def _classify_chunk_content(self, content: str) -> str:
+        """Classify the type of content in the chunk for better retrieval"""
+        content_lower = content.lower()
+        
+        # Look for content patterns
+        if any(word in content_lower for word in ['table', 'figure', 'chart', 'graph']):
+            return 'tabular'
+        elif any(word in content_lower for word in ['section', 'chapter', 'part']):
+            return 'heading'
+        elif content.count('•') > 2 or content.count('-') > 3:
+            return 'list'
+        elif any(word in content_lower for word in ['policy', 'condition', 'coverage', 'benefit']):
+            return 'policy_detail'
+        else:
+            return 'general'
 
     def _split_into_sentences(self, text: str) -> List[str]:
         """Split text into sentences using regex patterns"""

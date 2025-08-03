@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     api_reload: bool = True
-    api_timeout: int = 25
+    api_timeout: int = 120
     
     # Security
     bearer_token: str = "7c695e780a6ab6eacffab7c9326e5d8e472a634870a6365979c5671ad28f003c"
@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     embedding_dimension: int = 384
     
     # Qdrant Configuration
-    qdrant_host: str = "https://7c5b51e7-db3e-4b63-bc21-2a1e0e3b4d8a.us-east4-0.gcp.cloud.qdrant.io"
+    qdrant_host: str = "https://e3684ffe-4ac5-439b-9f91-6c43f5af9e78.eu-central-1-0.aws.cloud.qdrant.io:6333"
     qdrant_port: int = 6333
     qdrant_collection_name: str = "pdf_documents"
     qdrant_api_key: Optional[str] = None
@@ -40,16 +40,16 @@ class Settings(BaseSettings):
     redis_db: int = 0
     redis_password: Optional[str] = None
     
-    # Document Processing
-    chunk_size: int = 500
-    chunk_overlap: float = 0.25
+    # Document Processing - Optimized for better chunking
+    chunk_size: int = 800  # Increased from 500 for more context per chunk
+    chunk_overlap: float = 0.3  # Increased from 0.25 for better continuity
     max_pdf_size_mb: int = 50
     max_questions: int = 20
     
-    # Retrieval Configuration
-    top_k_chunks: int = 5
-    similarity_threshold: float = 0.7
-    context_window: int = 2000
+    # Retrieval Configuration - Optimized for better search
+    top_k_chunks: int = 10  # Increased from 5 for more comprehensive retrieval
+    similarity_threshold: float = 0.5  # Reduced from 0.7 for more inclusive retrieval
+    context_window: int = 4000  # Increased from 2000 for richer context
     
     # Logging
     log_level: str = "INFO"
