@@ -2,254 +2,107 @@ import asyncio
 import hashlib
 from typing import List, Optional, Dict, Any
 import numpy as np
-import torch
-from sentence_transformers import SentenceTransformer
 import httpx
 import json
 from loguru import logger
 import redis
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from config import get_settings
-from models import SearchResult
+# Free embedding service using Hugging Face Inference API
+import os
+from huggingface_hub import InferenceClient
+from dotenv import load_dotenv
 
-settings = get_settings()
+# Load environment variables
+load_dotenv()
 
 class EmbeddingService:
-    """Service for generating embeddings using sentence transformers"""
-    
+    """Service for generating embeddings using free Hugging Face Inference API"""
     def __init__(self):
-        self.model_name = settings.embedding_model
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = None
-        self.redis_client = None
-        self._initialize_services()
+        self.api_key = os.getenv("HF_TOKEN")
+        if not self.api_key:
+            raise ValueError("HF_TOKEN (Hugging Face API key) is required in .env")
+        
+        # Use standard HF Inference API (free tier) without provider
+        self.client = InferenceClient(token=self.api_key)
+        # Use a free, efficient model that's supported by standard HF API
+        self.model_id = "sentence-transformers/all-MiniLM-L6-v2"  # 384 dimensions, free
+        logger.info(f"Initialized free embedding service with model: {self.model_id}")
 
-    def _initialize_services(self):
-        """Initialize embedding model and Redis cache"""
+    async def generate_embedding(self, text: str) -> list:
+        """Generate embedding for a single text using free Hugging Face Inference API"""
         try:
-            logger.info(f"Loading embedding model: {self.model_name}")
-            self.model = SentenceTransformer(self.model_name, device=self.device)
-            logger.info(f"Embedding model loaded on {self.device}")
+            # Use the standard feature_extraction method (free tier)
+            result = self.client.feature_extraction(text, model=self.model_id)
             
-            # Initialize Redis for caching
-            if settings.redis_host:
-                try:
-                    self.redis_client = redis.Redis(
-                        host=settings.redis_host,
-                        port=settings.redis_port,
-                        db=settings.redis_db,
-                        password=settings.redis_password,
-                        decode_responses=True,
-                        socket_connect_timeout=2,
-                        socket_timeout=2
-                    )
-                    # Test connection
-                    self.redis_client.ping()
-                    logger.info("Redis cache initialized and connected")
-                except Exception as e:
-                    logger.warning(f"Redis connection failed, disabling cache: {e}")
-                    self.redis_client = None
+            # Handle different response formats
+            if hasattr(result, 'tolist'):  # numpy array
+                if result.ndim == 2 and result.shape[0] == 1:
+                    return result[0].tolist()
+                elif result.ndim == 1:
+                    return result.tolist()
+                return result.flatten().tolist()
+            elif isinstance(result, list):
+                if len(result) > 0 and isinstance(result[0], list):
+                    return result[0]  # Extract inner vector
+                return result
+            else:
+                # Convert to list if it's another format
+                return list(result) if hasattr(result, '__iter__') else [result]
                 
         except Exception as e:
-            logger.error(f"Failed to initialize embedding service: {e}")
+            # Log the error but try to provide more context
+            logger.error(f"Embedding generation failed for text length {len(text)}: {e}")
+            if "402" in str(e) or "payment" in str(e).lower():
+                raise ValueError("Embedding service requires payment. Please use a different model or provider.")
             raise
 
-    async def generate_embedding(self, text: str) -> List[float]:
-        """Generate embedding for text with caching"""
-        if not text.strip():
-            raise ValueError("Cannot generate embedding for empty text")
-        
-        # Check cache first
-        cache_key = self._get_cache_key(text)
-        if self.redis_client:
-            cached_embedding = await self._get_cached_embedding(cache_key)
-            if cached_embedding:
-                return cached_embedding
-        
-        # Generate embedding
+    async def generate_batch_embeddings(self, texts: list) -> list:
+        """Generate embeddings for a batch of texts using free Hugging Face Inference API"""
         try:
-            # Run embedding generation in thread pool for async compatibility
-            loop = asyncio.get_event_loop()
-            embedding = await loop.run_in_executor(
-                None, 
-                self._generate_embedding_sync, 
-                text
-            )
+            # Process in smaller batches to avoid timeouts and improve efficiency
+            batch_size = 5  # Process 5 texts at a time
+            all_embeddings = []
             
-            # Cache the result
-            if self.redis_client:
-                await self._cache_embedding(cache_key, embedding)
-            
-            return embedding.tolist()
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                logger.info(f"Processing embedding batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}")
+                
+                # Process batch concurrently
+                batch_embeddings = []
+                for text in batch:
+                    embedding = await self.generate_embedding(text)
+                    batch_embeddings.append(embedding)
+                
+                all_embeddings.extend(batch_embeddings)
+                
+            logger.info(f"Generated {len(all_embeddings)} embeddings successfully")
+            return all_embeddings
             
         except Exception as e:
-            logger.error(f"Failed to generate embedding: {e}")
+            logger.error(f"Batch embedding generation failed: {e}")
             raise
 
-    def _generate_embedding_sync(self, text: str) -> np.ndarray:
-        """Synchronous embedding generation"""
-        embedding = self.model.encode([text], convert_to_tensor=False)[0]
-        return embedding
 
-    async def generate_batch_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for multiple texts efficiently"""
-        if not texts:
-            return []
-        
-        # Filter out empty texts
-        valid_texts = [text for text in texts if text.strip()]
-        if not valid_texts:
-            raise ValueError("No valid texts provided for embedding generation")
-        
-        try:
-            loop = asyncio.get_event_loop()
-            embeddings = await loop.run_in_executor(
-                None,
-                self._generate_batch_embeddings_sync,
-                valid_texts
-            )
-            return embeddings.tolist()
-            
-        except Exception as e:
-            logger.error(f"Failed to generate batch embeddings: {e}")
-            raise
-
-    def _generate_batch_embeddings_sync(self, texts: List[str]) -> np.ndarray:
-        """Synchronous batch embedding generation"""
-        embeddings = self.model.encode(texts, convert_to_tensor=False)
-        return embeddings
-
-    def _get_cache_key(self, text: str) -> str:
-        """Generate cache key for text"""
-        text_hash = hashlib.sha256(text.encode()).hexdigest()
-        return f"embedding:{self.model_name}:{text_hash}"
-
-    async def _get_cached_embedding(self, cache_key: str) -> Optional[List[float]]:
-        """Get embedding from cache"""
-        try:
-            if self.redis_client:
-                cached = self.redis_client.get(cache_key)
-                if cached:
-                    return json.loads(cached)
-        except Exception as e:
-            logger.warning(f"Failed to get cached embedding: {e}")
-        return None
-
-    async def _cache_embedding(self, cache_key: str, embedding: List[float], ttl: int = 86400):
-        """Cache embedding with TTL (default 24 hours)"""
-        try:
-            if self.redis_client:
-                # Convert numpy array to list if needed
-                if hasattr(embedding, 'tolist'):
-                    embedding = embedding.tolist()
-                self.redis_client.setex(cache_key, ttl, json.dumps(embedding))
-        except Exception as e:
-            logger.warning(f"Failed to cache embedding: {e}")
-
-class GenerativeModel:
-    """Service for text generation using OpenRouter API with Qwen models"""
-    
+class GenerationService:
+    """Service for generating text completions using OpenRouter API"""
     def __init__(self):
-        self.model_name = settings.generative_model
-        self.api_key = settings.openrouter_api_key
-        self.use_openrouter = settings.use_openrouter
-        self.max_length = settings.max_sequence_length
+        self.api_key = os.getenv("OPENROUTER_API_KEY")
+        self.model_name = os.getenv("GENERATION_MODEL", "qwen/qwen3-8b")  
         self.base_url = "https://openrouter.ai/api/v1"
-        
-        if self.use_openrouter and not self.api_key:
-            raise ValueError("OpenRouter API key is required when use_openrouter is True")
-        
-        logger.info(f"Initialized GenerativeModel with {'OpenRouter API' if self.use_openrouter else 'local model'}")
+        if not self.api_key:
+            raise ValueError("OPENROUTER_API_KEY is required in .env")
 
-    async def generate_enhanced_answer(self, question: str, context: str) -> str:
-        """Generate enhanced answer with better prompting and handling"""
-        if not question.strip():
-            raise ValueError("Question cannot be empty")
-        
-        if not context.strip():
-            return "The document does not contain information to answer this question."
-        
-        # Create enhanced prompt
-        prompt = self._create_enhanced_prompt(question, context)
-        
+    async def generate(self, question: str, context: str) -> str:
+        """Generate answer based on question and context"""
+        prompt = self._create_prompt(question, context)
         try:
-            if self.use_openrouter:
-                answer = await self._generate_with_openrouter_enhanced(prompt)
-            else:
-                answer = await self._generate_with_local_model(prompt)
-            
-            # Clean and validate answer
-            cleaned_answer = self._clean_and_validate_answer(answer, question)
+            raw_answer = await self._generate_with_openrouter(prompt)
+            cleaned_answer = self._clean_and_validate_answer(raw_answer, question)
             return cleaned_answer
-            
         except Exception as e:
-            logger.error(f"Failed to generate enhanced answer: {e}")
-            return "I apologize, but I encountered an error while generating the answer."
-
-    def _create_enhanced_prompt(self, question: str, context: str) -> str:
-        """Create an enhanced prompt for better answer generation"""
-        prompt = f"""You are an expert document analyst. Your task is to answer questions based STRICTLY on the provided context from a document.
-
-INSTRUCTIONS:
-1. Read the context carefully and identify relevant information
-2. Answer the question using ONLY information explicitly stated in the context
-3. If specific details are mentioned, include them in your answer
-4. Quote exact phrases when they directly answer the question
-5. Keep answers concise but complete (2-4 sentences maximum)
-6. If the context doesn't contain the answer, respond: "The document does not contain information to answer this question."
-
-CONTEXT FROM DOCUMENT:
-{context}
-
-QUESTION: {question}
-
-Based on the context provided above, provide a precise and factual answer:"""
-        return prompt
-
-    async def _generate_with_openrouter_enhanced(self, prompt: str) -> str:
-        """Enhanced generation using OpenRouter API with optimized parameters"""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/yourusername/rag-pipeline",
-            "X-Title": "RAG PDF QA Pipeline"
-        }
-        
-        payload = {
-            "model": self.model_name,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a precise document analyst that provides accurate, concise answers based strictly on document context. Never add external information."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "max_tokens": 300,  # Increased slightly for more complete answers
-            "temperature": 0.1,  # Very low for factual responses
-            "top_p": 0.9,
-            "frequency_penalty": 0.1,  # Slight penalty to avoid repetition
-            "presence_penalty": 0.1,   # Encourage focused responses
-            "stream": False
-        }
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            
-            if "choices" in result and len(result["choices"]) > 0:
-                return result["choices"][0]["message"]["content"]
-            else:
-                raise ValueError("No response generated from OpenRouter API")
+            logger.error(f"Generation error: {e}")
+            return "I apologize, but I'm unable to generate an answer at the moment. Please try again."
 
     def _clean_and_validate_answer(self, answer: str, question: str) -> str:
         """Clean and validate the generated answer"""

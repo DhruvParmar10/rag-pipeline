@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 from loguru import logger
 
 from pdf_processor import PDFProcessor, TextChunker
-from ai_services import EmbeddingService, GenerativeModel
+from ai_services import EmbeddingService, GenerationService
 from vector_store import VectorStore
 from models import DocumentChunk, SearchResult
 from config import get_settings
@@ -18,7 +18,7 @@ class RAGPipeline:
         self.pdf_processor = PDFProcessor()
         self.text_chunker = TextChunker()
         self.embedding_service = EmbeddingService()
-        self.generative_model = GenerativeModel()
+        self.generation_service = GenerationService()
         self.vector_store = VectorStore()
         
         # Cache for processed documents (in production, use Redis or database)
@@ -103,7 +103,7 @@ class RAGPipeline:
                 context = self._prepare_enhanced_context(search_results, question)
                 
                 # Step 4: Generate answer using enhanced context
-                answer = await self.generative_model.generate_enhanced_answer(question, context)
+                answer = await self.generation_service.generate(question, context)
                 answers.append(answer)
                 
                 logger.info(f"Question {i+1} answered successfully")
@@ -115,14 +115,17 @@ class RAGPipeline:
         return answers
 
     async def _enhanced_retrieval(self, question: str, document_hash: str) -> List[SearchResult]:
-        """Enhanced retrieval using multiple strategies"""
+        """Enhanced retrieval optimized for speed and accuracy"""
         try:
-            # Strategy 1: Direct semantic search
+            # Strategy 1: Direct semantic search with optimized settings
             question_embedding = await self.embedding_service.generate_embedding(question)
+            
+            # Use a more relaxed search first to get more candidates
             primary_results = await self.vector_store.search_similar_chunks(
                 query_embedding=question_embedding,
                 document_url=None,  # Search across all documents first
-                top_k=settings.top_k_chunks
+                top_k=settings.top_k_chunks * 2,  # Get more candidates
+                threshold=settings.similarity_threshold * 0.8  # More permissive
             )
             
             # Filter by document hash if we have it
@@ -132,20 +135,14 @@ class RAGPipeline:
                 if result_hash == document_hash:
                     filtered_results.append(result)
             
-            # Strategy 2: Keyword-based fallback if semantic search yields few results
-            if len(filtered_results) < settings.top_k_chunks // 2:
-                keyword_results = await self._keyword_search(question, document_hash)
-                # Merge and deduplicate
-                all_results = filtered_results + keyword_results
-                filtered_results = self._deduplicate_results(all_results)
-            
-            # Strategy 3: Relaxed threshold search if still not enough results
+            # If we still don't have enough results, try even more relaxed search
             if len(filtered_results) < 3:
+                logger.info(f"Only {len(filtered_results)} results found, trying relaxed search...")
                 relaxed_results = await self.vector_store.search_similar_chunks(
                     query_embedding=question_embedding,
                     document_url=None,
-                    top_k=settings.top_k_chunks * 2,
-                    threshold=settings.similarity_threshold * 0.7  # More relaxed
+                    top_k=settings.top_k_chunks * 3,
+                    threshold=0.1  # Very permissive threshold
                 )
                 # Filter and merge
                 for result in relaxed_results:
@@ -155,7 +152,10 @@ class RAGPipeline:
             
             # Sort by relevance and return top results
             filtered_results.sort(key=lambda x: x.score, reverse=True)
-            return filtered_results[:settings.top_k_chunks]
+            final_results = filtered_results[:settings.top_k_chunks]
+            
+            logger.info(f"Retrieved {len(final_results)} relevant chunks for question")
+            return final_results
             
         except Exception as e:
             logger.error(f"Enhanced retrieval failed: {e}")
@@ -256,14 +256,13 @@ class RAGPipeline:
             health_status["services"]["vector_store"] = "healthy" if vector_store_healthy else "unhealthy"
             
             # Check if models are loaded
-            embedding_healthy = self.embedding_service.model is not None
+            embedding_healthy = self.embedding_service.api_key is not None
             health_status["services"]["embedding_service"] = "healthy" if embedding_healthy else "unhealthy"
             
             generative_healthy = (
-                self.generative_model.use_openrouter and 
-                self.generative_model.api_key is not None
-            ) or not self.generative_model.use_openrouter
-            health_status["services"]["generative_model"] = "healthy" if generative_healthy else "unhealthy"
+                self.generation_service.api_key is not None
+            )
+            health_status["services"]["generation_service"] = "healthy" if generative_healthy else "unhealthy"
             
             # Overall health
             all_healthy = all(

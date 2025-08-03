@@ -21,12 +21,13 @@ class Settings(BaseSettings):
     bearer_token: str = "7c695e780a6ab6eacffab7c9326e5d8e472a634870a6365979c5671ad28f003c"
     
     # Model Configuration
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_model: str = "Qwen/Qwen3-Embedding-8B"
     generative_model: str = "qwen/qwen-2.5-72b-instruct"
     openrouter_api_key: Optional[str] = None
     use_openrouter: bool = True
     max_sequence_length: int = 4096
     embedding_dimension: int = 384
+    hf_token: Optional[str] = None
     
     # Qdrant Configuration
     qdrant_host: str = "https://e3684ffe-4ac5-439b-9f91-6c43f5af9e78.eu-central-1-0.aws.cloud.qdrant.io:6333"
@@ -46,10 +47,10 @@ class Settings(BaseSettings):
     max_pdf_size_mb: int = 50
     max_questions: int = 20
     
-    # Retrieval Configuration - Optimized for better search
-    top_k_chunks: int = 10  # Increased from 5 for more comprehensive retrieval
-    similarity_threshold: float = 0.5  # Reduced from 0.7 for more inclusive retrieval
-    context_window: int = 4000  # Increased from 2000 for richer context
+    # Retrieval Configuration - Optimized for better search with 384-dim embeddings
+    top_k_chunks: int = 8  # Reduced for faster processing with better focus
+    similarity_threshold: float = 0.3  # Much lower threshold for 384-dim embeddings
+    context_window: int = 3000  # Slightly reduced for faster processing
     
     # Logging
     log_level: str = "INFO"
