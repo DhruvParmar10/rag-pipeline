@@ -47,18 +47,18 @@ Create `.env` file:
 
 ```env
 # API Keys
-HF_TOKEN=your_huggingface_token
+GEMINI_API_KEY=your_gemini_api_key
 OPENROUTER_API_KEY=your_openrouter_key
 QDRANT_API_KEY=your_qdrant_key
 
 # Model Configuration
-EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-EMBEDDING_DIMENSION=384
+EMBEDDING_MODEL=text-embedding-004
+EMBEDDING_DIMENSION=768
 GENERATIVE_MODEL=qwen/qwen-2.5-72b-instruct
 
 # Qdrant Configuration
 QDRANT_HOST=https://your-cluster.qdrant.io:6333
-QDRANT_COLLECTION_NAME=pdf_documents_384
+QDRANT_COLLECTION_NAME=pdf_documents_768
 
 # Security
 BEARER_TOKEN=your_secure_token
@@ -76,6 +76,8 @@ Server starts at `http://localhost:8000`
 
 ### Process Document & Answer Questions
 
+**Request:**
+
 ```http
 POST /api/v1/hackrx/run
 Authorization: Bearer your_bearer_token
@@ -84,8 +86,25 @@ Content-Type: application/json
 {
   "document_url": "https://example.com/document.pdf",
   "questions": [
-    "What is the main topic?",
-    "What are the key findings?"
+    "What is the grace period for premium payment?",
+    "What is the waiting period for pre-existing diseases?",
+    "Does this policy cover maternity expenses?",
+    "What is the waiting period for cataract surgery?",
+    "Are the medical expenses for an organ donor covered?"
+  ]
+}
+```
+
+**Response:**
+
+```json
+{
+  "answers": [
+    "A grace period of thirty days is provided for premium payment after the due date to renew or continue the policy without losing continuity benefits.",
+    "There is a waiting period of thirty-six (36) months of continuous coverage from the first policy inception for pre-existing diseases and their direct complications to be covered.",
+    "Yes, the policy covers maternity expenses, including childbirth and lawful medical termination of pregnancy. To be eligible, the female insured person must have been continuously covered for at least 24 months. The benefit is limited to two deliveries or terminations during the policy period.",
+    "The policy has a specific waiting period of two (2) years for cataract surgery.",
+    "Yes, the policy indemnifies the medical expenses for the organ donor's hospitalization for the purpose of harvesting the organ, provided the organ is for an insured person and the donation complies with the Transplantation of Human Organs Act, 1994."
   ]
 }
 ```
@@ -98,22 +117,23 @@ GET /health
 
 ## Embedding Models
 
-### Current: 384-dimension model (Fast)
+### Current: 768-dimension Gemini model (High Quality)
 
 ```env
-EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-EMBEDDING_DIMENSION=384
-```
-
-### For Higher Accuracy (Slower)
-
-```env
-EMBEDDING_MODEL=sentence-transformers/all-mpnet-base-v2
+EMBEDDING_MODEL=text-embedding-004
 EMBEDDING_DIMENSION=768
 QDRANT_COLLECTION_NAME=pdf_documents_768
 ```
 
-⚠️ **Note**: Changing embedding models requires recreating the Qdrant collection.
+### Alternative: Free Hugging Face models
+
+```env
+EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+EMBEDDING_DIMENSION=384
+QDRANT_COLLECTION_NAME=pdf_documents_384
+```
+
+⚠️ **Note**: Changing embedding models requires recreating the Qdrant collection with matching dimensions.
 
 ## Performance
 
@@ -137,7 +157,7 @@ QDRANT_COLLECTION_NAME=pdf_documents_768
 
 - **FastAPI**: REST API framework
 - **Qdrant**: Vector database
-- **Hugging Face**: Embedding models
+- **Google Generative AI**: Gemini embedding models
 - **OpenRouter**: Text generation
 - **PDFPlumber**: PDF text extraction
 

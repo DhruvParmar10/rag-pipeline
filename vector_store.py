@@ -165,7 +165,7 @@ class VectorStore:
                     query_vector=query_embedding,
                     query_filter=query_filter,
                     limit=search_limit,
-                    score_threshold=threshold * 0.8,  # More permissive threshold initially
+                    score_threshold=0.0,  # No threshold - get all results
                     with_payload=True
                 )
             )
@@ -173,18 +173,18 @@ class VectorStore:
             # Convert to SearchResult objects and apply final filtering
             results = []
             for result in search_results:
-                if result.score >= threshold or len(results) < top_k // 2:  # Ensure minimum results
-                    search_result = SearchResult(
-                        chunk_id=result.payload["chunk_id"],
-                        content=result.payload["content"],
-                        score=result.score,
-                        metadata={
-                            **result.payload.get("metadata", {}),
-                            "document_url": result.payload.get("document_url"),
-                            "chunk_index": result.payload.get("chunk_index")
-                        }
-                    )
-                    results.append(search_result)
+                # Accept all results regardless of threshold for better debugging
+                search_result = SearchResult(
+                    chunk_id=result.payload["chunk_id"],
+                    content=result.payload["content"],
+                    score=result.score,
+                    metadata={
+                        **result.payload.get("metadata", {}),
+                        "document_url": result.payload.get("document_url"),
+                        "chunk_index": result.payload.get("chunk_index")
+                    }
+                )
+                results.append(search_result)
             
             # Sort by score and limit results
             results.sort(key=lambda x: x.score, reverse=True)

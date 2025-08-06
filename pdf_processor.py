@@ -259,18 +259,57 @@ class TextChunker:
         return text.strip()
 
     def _smart_sentence_split(self, text: str) -> List[str]:
-        """Enhanced sentence splitting with better boundary detection"""
+        """Enhanced sentence splitting with content filtering for speed"""
         # Basic sentence split
         sentences = re.split(r'(?<=[.!?])\s+', text)
         
-        # Filter out very short "sentences" that are likely fragments
+        # Filter out less valuable sentences for speed optimization
         filtered_sentences = []
         for sentence in sentences:
             sentence = sentence.strip()
-            if len(sentence) > 10 and not re.match(r'^\d+\.?\s*$', sentence):  # Skip lone numbers
+            if self._is_valuable_sentence(sentence):
                 filtered_sentences.append(sentence)
         
         return filtered_sentences
+    
+    def _is_valuable_sentence(self, sentence: str) -> bool:
+        """Determine if a sentence contains valuable information worth embedding"""
+        if len(sentence) < 15:  # Too short to be meaningful
+            return False
+            
+        # Skip pure numbers, dates, or references
+        if re.match(r'^\d+\.?\s*$', sentence) or re.match(r'^[A-Z0-9\s\-.,]+$', sentence):
+            return False
+        
+        # Skip common boilerplate patterns
+        boilerplate_patterns = [
+            r'^page \d+',
+            r'^see (page|section|appendix)',
+            r'^for more information',
+            r'^please refer to',
+            r'^as mentioned (above|below|earlier)',
+            r'^table \d+',
+            r'^figure \d+',
+        ]
+        
+        sentence_lower = sentence.lower()
+        for pattern in boilerplate_patterns:
+            if re.search(pattern, sentence_lower):
+                return False
+        
+        # Prioritize sentences with important keywords
+        important_keywords = [
+            'coverage', 'benefit', 'policy', 'claim', 'premium', 'deductible',
+            'exclusion', 'limitation', 'condition', 'requirement', 'eligible',
+            'payment', 'reimbursement', 'treatment', 'service', 'provider'
+        ]
+        
+        # Keep sentences with important keywords even if shorter
+        if any(keyword in sentence_lower for keyword in important_keywords):
+            return len(sentence) >= 10
+        
+        # For general sentences, require more substantial length
+        return len(sentence) >= 20 and len(sentence.split()) >= 4
 
     def _get_smart_overlap(self, chunk_content: str) -> str:
         """Get intelligent overlap content focusing on complete sentences"""

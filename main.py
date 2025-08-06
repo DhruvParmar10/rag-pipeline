@@ -20,12 +20,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from models import HackRXRequest, HackRXResponse, HealthResponse
-from rag_pipeline import RAGPipeline
+from advanced_rag_pipeline import AdvancedRAGPipeline
 from config import get_settings
 
 settings = get_settings()
 
-# Global RAG pipeline instance
+# Global Advanced RAG pipeline instance
 rag_pipeline = None
 
 @asynccontextmanager
@@ -34,18 +34,18 @@ async def lifespan(app: FastAPI):
     global rag_pipeline
     
     # Startup
-    logger.info("Initializing RAG Pipeline...")
+    logger.info("Initializing Advanced RAG Pipeline...")
     try:
-        rag_pipeline = RAGPipeline()
-        logger.info("RAG Pipeline initialized successfully")
+        rag_pipeline = AdvancedRAGPipeline()
+        logger.info("Advanced RAG Pipeline initialized successfully")
     except Exception as e:
-        logger.error(f"Failed to initialize RAG Pipeline: {e}")
+        logger.error(f"Failed to initialize Advanced RAG Pipeline: {e}")
         raise
     
     yield
     
     # Shutdown
-    logger.info("Shutting down RAG Pipeline...")
+    logger.info("Shutting down Advanced RAG Pipeline...")
 
 # Create FastAPI app
 app = FastAPI(

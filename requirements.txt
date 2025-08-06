@@ -17,3 +17,4 @@ tenacity==8.2.3
 setuptools
 wheel
 huggingface_hub>=0.21.0
+google-generativeai>=0.3.0

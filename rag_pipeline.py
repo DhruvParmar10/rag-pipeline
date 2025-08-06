@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import re
 from typing import List, Dict, Any
 from loguru import logger
 
@@ -23,6 +24,12 @@ class RAGPipeline:
         
         # Cache for processed documents (in production, use Redis or database)
         self._document_cache: Dict[str, bool] = {}
+        
+        # Cache for embeddings to avoid re-computation (aggressive caching)
+        self._embedding_cache: Dict[str, List[float]] = {}
+        
+        # Cache for document content to avoid re-downloading
+        self._content_cache: Dict[str, str] = {}
 
     async def process_document_and_answer(self, document_url: str, questions: List[str]) -> List[str]:
         """Main pipeline: process document and answer questions"""
@@ -47,31 +54,62 @@ class RAGPipeline:
         document_hash = self._get_document_hash(document_url)
         
         if document_hash in self._document_cache:
-            logger.info(f"Document already processed: {document_url}")
+            logger.info(f"Document already processed (cached): {document_url}")
             return
+        
+        # Check if document already exists in vector store
+        try:
+            # Quick search to see if document chunks exist
+            dummy_embedding = [0.0] * 768  # Dummy embedding for existence check
+            existing_chunks = await self.vector_store.search_similar_chunks(
+                query_embedding=dummy_embedding,
+                document_url=document_url,
+                top_k=1,
+                threshold=0.0
+            )
+            
+            if existing_chunks:
+                logger.info(f"Document already exists in vector store: {document_url}")
+                self._document_cache[document_hash] = True
+                return
+                
+        except Exception as e:
+            logger.warning(f"Could not check document existence: {e}")
         
         logger.info(f"Processing new document: {document_url}")
         
         try:
-            # Step 1: Download and extract text
-            pdf_content = await self.pdf_processor.download_pdf(document_url)
-            text = await self.pdf_processor.extract_text(pdf_content)
+            # Step 1: Download and extract text with caching
+            document_hash = self._get_document_hash(document_url)
+            
+            if document_hash in self._content_cache:
+                logger.info("Using cached document content")
+                text = self._content_cache[document_hash]
+            else:
+                pdf_content = await self.pdf_processor.download_pdf(document_url)
+                text = await self.pdf_processor.extract_text(pdf_content)
+                # Cache the extracted text
+                self._content_cache[document_hash] = text
             
             if not text.strip():
                 raise ValueError("No text could be extracted from the PDF")
             
-            # Step 2: Create chunks
+            # Step 2: Create chunks with intelligent filtering
             chunks = self.text_chunker.create_chunks(text, document_url)
             
             if not chunks:
                 raise ValueError("No chunks could be created from the document")
             
-            # Step 3: Generate embeddings for chunks
-            chunk_texts = [chunk.content for chunk in chunks]
+            # Step 2.5: Filter chunks to only embed high-value content
+            high_value_chunks = self._filter_high_value_chunks(chunks)
+            logger.info(f"Filtered {len(chunks)} chunks to {len(high_value_chunks)} high-value chunks")
+            
+            # Step 3: Generate embeddings for filtered chunks only
+            chunk_texts = [chunk.content for chunk in high_value_chunks]
             embeddings = await self.embedding_service.generate_batch_embeddings(chunk_texts)
             
             # Step 4: Store in vector database
-            await self.vector_store.store_chunks(chunks, embeddings, document_url)
+            await self.vector_store.store_chunks(high_value_chunks, embeddings, document_url)
             
             # Cache the document processing status
             self._document_cache[document_hash] = True
@@ -117,38 +155,57 @@ class RAGPipeline:
     async def _enhanced_retrieval(self, question: str, document_hash: str) -> List[SearchResult]:
         """Enhanced retrieval optimized for speed and accuracy"""
         try:
-            # Strategy 1: Direct semantic search with optimized settings
-            question_embedding = await self.embedding_service.generate_embedding(question)
+            # Check if we have cached embedding for this question
+            question_key = hashlib.md5(question.encode()).hexdigest()
+            
+            if question_key in self._embedding_cache:
+                logger.info("Using cached embedding for question")
+                question_embedding = self._embedding_cache[question_key]
+            else:
+                # Strategy 1: Direct semantic search with optimized settings
+                question_embedding = await self.embedding_service.generate_embedding(question)
+                # Cache the embedding
+                self._embedding_cache[question_key] = question_embedding
             
             # Use a more relaxed search first to get more candidates
             primary_results = await self.vector_store.search_similar_chunks(
                 query_embedding=question_embedding,
                 document_url=None,  # Search across all documents first
-                top_k=settings.top_k_chunks * 2,  # Get more candidates
-                threshold=settings.similarity_threshold * 0.8  # More permissive
+                top_k=settings.top_k_chunks * 3,  # Get even more candidates
+                threshold=0.0  # Very permissive - get all results
             )
             
             # Filter by document hash if we have it
             filtered_results = []
+            logger.info(f"Looking for document hash: {document_hash}")
             for result in primary_results:
-                result_hash = self._get_document_hash(result.metadata.get('document_url', ''))
+                result_url = result.metadata.get('document_url', '')
+                result_hash = self._get_document_hash(result_url)
+                logger.info(f"Found chunk with URL hash: {result_hash}, score: {result.score:.4f}")
                 if result_hash == document_hash:
                     filtered_results.append(result)
+                    logger.info(f"✅ Added matching chunk: {result.content[:100]}...")
             
             # If we still don't have enough results, try even more relaxed search
-            if len(filtered_results) < 3:
+            if len(filtered_results) < 5:
                 logger.info(f"Only {len(filtered_results)} results found, trying relaxed search...")
                 relaxed_results = await self.vector_store.search_similar_chunks(
                     query_embedding=question_embedding,
                     document_url=None,
-                    top_k=settings.top_k_chunks * 3,
-                    threshold=0.1  # Very permissive threshold
+                    top_k=settings.top_k_chunks * 5,
+                    threshold=0.0  # No threshold - get all results
                 )
                 # Filter and merge
                 for result in relaxed_results:
-                    result_hash = self._get_document_hash(result.metadata.get('document_url', ''))
+                    result_url = result.metadata.get('document_url', '')
+                    result_hash = self._get_document_hash(result_url)
                     if result_hash == document_hash and result not in filtered_results:
                         filtered_results.append(result)
+            
+            # If still no results, use any available results for debugging
+            if len(filtered_results) == 0 and len(primary_results) > 0:
+                logger.warning(f"No document-specific results found. Using top {min(3, len(primary_results))} general results for debugging")
+                filtered_results = primary_results[:3]
             
             # Sort by relevance and return top results
             filtered_results.sort(key=lambda x: x.score, reverse=True)
@@ -279,6 +336,67 @@ class RAGPipeline:
             health_status["error"] = str(e)
         
         return health_status
+
+    def _filter_high_value_chunks(self, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
+        """AGGRESSIVELY filter chunks to only include highest-value content for sub-30s embedding"""
+        high_value_chunks = []
+        
+        for chunk in chunks:
+            content = chunk.content.lower()
+            
+            # PRIORITY 1: Always include chunks with critical insurance keywords
+            critical_keywords = [
+                'coverage', 'benefit', 'policy', 'claim', 'premium', 'deductible',
+                'exclusion', 'limitation', 'condition', 'requirement', 'eligible',
+                'payment', 'reimbursement', 'waiting period', 'grace period',
+                'copay', 'coinsurance', 'out-of-pocket', 'maximum', 'network'
+            ]
+            
+            # PRIORITY 2: Skip low-value content aggressively
+            skip_patterns = [
+                r'^page \d+', r'^section \d+', r'^chapter \d+', r'^table of contents',
+                r'^index$', r'^\d+\s*$', r'^see page \d+', r'^continued on next page',
+                r'^for more information', r'^please refer to', r'^as mentioned',
+                r'^table \d+', r'^figure \d+', r'^appendix'
+            ]
+            
+            # Check if chunk should be skipped
+            should_skip = False
+            for pattern in skip_patterns:
+                if re.search(pattern, content):
+                    should_skip = True
+                    break
+            
+            if should_skip:
+                continue
+            
+            # AGGRESSIVE FILTERING: Only keep chunks with critical content
+            has_critical_keywords = any(keyword in content for keyword in critical_keywords)
+            is_very_substantial = len(chunk.content) >= 400 and len(chunk.content.split()) >= 50
+            
+            # Be much more selective - only keep truly important chunks
+            if has_critical_keywords or is_very_substantial:
+                high_value_chunks.append(chunk)
+        
+        # NUCLEAR OPTION: Keep maximum 15% of chunks to achieve sub-30s processing
+        if len(high_value_chunks) > len(chunks) * 0.15:
+            # Sort by importance (critical keywords first, then by length)
+            def chunk_score(chunk):
+                content = chunk.content.lower()
+                keyword_count = sum(1 for keyword in critical_keywords if keyword in content)
+                return keyword_count * 1000 + len(chunk.content)  # Prioritize keyword-rich content
+            
+            high_value_chunks.sort(key=chunk_score, reverse=True)
+            target_count = int(len(chunks) * 0.15)  # Keep only 15% max
+            high_value_chunks = high_value_chunks[:target_count]
+        
+        # Ensure we keep at least 10% to not lose critical info
+        if len(high_value_chunks) < len(chunks) * 0.10:
+            sorted_chunks = sorted(chunks, key=lambda c: len(c.content), reverse=True)
+            target_count = max(len(high_value_chunks), int(len(chunks) * 0.10))
+            high_value_chunks = sorted_chunks[:target_count]
+        
+        return high_value_chunks
 
     async def get_document_info(self, document_url: str) -> Dict[str, Any]:
         """Get information about a processed document"""

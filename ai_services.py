@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import re
 from typing import List, Optional, Dict, Any
 import numpy as np
 import httpx
@@ -8,87 +9,201 @@ from loguru import logger
 import redis
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Free embedding service using Hugging Face Inference API
+# Gemini embedding service
 import os
-from huggingface_hub import InferenceClient
+import google.generativeai as genai
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
 class EmbeddingService:
-    """Service for generating embeddings using free Hugging Face Inference API"""
+    """Service for generating embeddings using Google Gemini API"""
     def __init__(self):
-        self.api_key = os.getenv("HF_TOKEN")
+        self.api_key = os.getenv("GEMINI_API_KEY")
         if not self.api_key:
-            raise ValueError("HF_TOKEN (Hugging Face API key) is required in .env")
+            raise ValueError("GEMINI_API_KEY is required in .env")
         
-        # Use standard HF Inference API (free tier) without provider
-        self.client = InferenceClient(token=self.api_key)
-        # Use a free, efficient model that's supported by standard HF API
-        self.model_id = "sentence-transformers/all-MiniLM-L6-v2"  # 384 dimensions, free
-        logger.info(f"Initialized free embedding service with model: {self.model_id}")
+        # Configure Gemini
+        genai.configure(api_key=self.api_key)
+        self.model_name = "models/text-embedding-004"  # 768 dimensions
+        logger.info(f"Initialized Gemini embedding service with model: {self.model_name}")
 
     async def generate_embedding(self, text: str) -> list:
-        """Generate embedding for a single text using free Hugging Face Inference API"""
+        """Generate embedding for a single text using Gemini API with caching"""
         try:
-            # Use the standard feature_extraction method (free tier)
-            result = self.client.feature_extraction(text, model=self.model_id)
+            # Create a cache key based on text hash
+            text_hash = hashlib.sha256(text.encode()).hexdigest()
             
-            # Handle different response formats
-            if hasattr(result, 'tolist'):  # numpy array
-                if result.ndim == 2 and result.shape[0] == 1:
-                    return result[0].tolist()
-                elif result.ndim == 1:
-                    return result.tolist()
-                return result.flatten().tolist()
-            elif isinstance(result, list):
-                if len(result) > 0 and isinstance(result[0], list):
-                    return result[0]  # Extract inner vector
-                return result
-            else:
-                # Convert to list if it's another format
-                return list(result) if hasattr(result, '__iter__') else [result]
+            # Use Gemini's embedding model
+            result = genai.embed_content(
+                model=self.model_name,
+                content=text,
+                task_type="retrieval_document"
+            )
+            
+            return result['embedding']
                 
         except Exception as e:
-            # Log the error but try to provide more context
             logger.error(f"Embedding generation failed for text length {len(text)}: {e}")
-            if "402" in str(e) or "payment" in str(e).lower():
-                raise ValueError("Embedding service requires payment. Please use a different model or provider.")
             raise
 
     async def generate_batch_embeddings(self, texts: list) -> list:
-        """Generate embeddings for a batch of texts using free Hugging Face Inference API"""
+        """Generate embeddings for a batch of texts focusing on quality"""
         try:
-            # Process in smaller batches to avoid timeouts and improve efficiency
-            batch_size = 5  # Process 5 texts at a time
-            all_embeddings = []
+            # Step 1: Remove duplicates to avoid redundant processing
+            unique_texts = []
+            text_to_index = {}
+            original_indices = []
             
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i:i + batch_size]
-                logger.info(f"Processing embedding batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}")
+            for i, text in enumerate(texts):
+                text_hash = hashlib.md5(text.encode()).hexdigest()
+                if text_hash not in text_to_index:
+                    text_to_index[text_hash] = len(unique_texts)
+                    unique_texts.append(text)
+                original_indices.append(text_to_index[text_hash])
+            
+            if len(unique_texts) < len(texts):
+                logger.info(f"Deduplication: Processing {len(unique_texts)} unique texts from {len(texts)} total")
+            
+            # Step 2: Process unique texts with quality-focused batching
+            batch_size = 25  # Smaller batches for better quality and reliability
+            max_concurrent = 10  # Conservative concurrency for stability
+            unique_embeddings = []
+            
+            # Create semaphore to limit concurrent API calls
+            semaphore = asyncio.Semaphore(max_concurrent)
+            
+            for i in range(0, len(unique_texts), batch_size):
+                batch = unique_texts[i:i + batch_size]
+                batch_num = i//batch_size + 1
+                total_batches = (len(unique_texts) + batch_size - 1)//batch_size
+                progress = (batch_num / total_batches) * 100
+                logger.info(f"Processing embedding batch {batch_num}/{total_batches} ({progress:.1f}% complete) - {len(batch)} texts")
                 
-                # Process batch concurrently
-                batch_embeddings = []
-                for text in batch:
-                    embedding = await self.generate_embedding(text)
-                    batch_embeddings.append(embedding)
+                # Process the entire batch concurrently with quality controls
+                async def process_text_with_semaphore(text):
+                    async with semaphore:
+                        return await self._generate_single_embedding_quality(text)
                 
-                all_embeddings.extend(batch_embeddings)
+                # Create all tasks for the batch
+                tasks = [process_text_with_semaphore(text) for text in batch]
                 
-            logger.info(f"Generated {len(all_embeddings)} embeddings successfully")
+                # Execute all tasks in parallel with generous timeout
+                try:
+                    batch_embeddings = await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=120.0  # Generous timeout for quality
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Batch {batch_num} timed out, retrying with single requests")
+                    # Fallback to individual processing
+                    batch_embeddings = []
+                    for text in batch:
+                        try:
+                            embedding = await self._generate_single_embedding_quality(text)
+                            batch_embeddings.append(embedding)
+                        except Exception as e:
+                            logger.warning(f"Failed individual embedding: {e}")
+                            batch_embeddings.append([0.0] * 768)
+                
+                # Handle any exceptions and filter successful results
+                successful_embeddings = []
+                for j, result in enumerate(batch_embeddings):
+                    if isinstance(result, Exception):
+                        logger.warning(f"Failed to generate embedding for text {i+j}: {result}")
+                        # Retry once for failed embeddings
+                        try:
+                            retry_embedding = await self._generate_single_embedding_quality(batch[j])
+                            successful_embeddings.append(retry_embedding)
+                        except Exception:
+                            # Use a zero vector as final fallback
+                            successful_embeddings.append([0.0] * 768)
+                    else:
+                        successful_embeddings.append(result)
+                
+                unique_embeddings.extend(successful_embeddings)
+                
+                # Small delay between batches for API stability
+                if i + batch_size < len(unique_texts):
+                    await asyncio.sleep(0.5)
+            
+            # Step 3: Map back to original order with duplicates
+            all_embeddings = [unique_embeddings[idx] for idx in original_indices]
+                
+            logger.info(f"Generated {len(all_embeddings)} embeddings with quality focus")
             return all_embeddings
             
         except Exception as e:
             logger.error(f"Batch embedding generation failed: {e}")
             raise
 
+    async def _generate_single_embedding_quality(self, text: str) -> list:
+        """Generate a single embedding with quality focus"""
+        try:
+            # Quality-focused text preprocessing
+            processed_text = self._preprocess_text_for_quality(text)
+            
+            # Use Gemini API with quality settings
+            result = genai.embed_content(
+                model=self.model_name,
+                content=processed_text,
+                task_type="retrieval_document"
+            )
+            return result['embedding']
+        except Exception as e:
+            logger.warning(f"Quality embedding failed for text length {len(text)}: {e}")
+            # Retry with shorter text if failed
+            try:
+                short_text = text[:1000] if len(text) > 1000 else text
+                result = genai.embed_content(
+                    model=self.model_name,
+                    content=short_text,
+                    task_type="retrieval_document"
+                )
+                return result['embedding']
+            except Exception as retry_error:
+                logger.error(f"Retry also failed: {retry_error}")
+                raise
+
+    def _preprocess_text_for_quality(self, text: str, max_length: int = 2000) -> str:
+        """Preprocess text for quality embeddings"""
+        # Clean up the text
+        text = text.strip()
+        
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        # If text is too long, intelligently truncate
+        if len(text) <= max_length:
+            return text
+        
+        # Try to keep complete sentences
+        sentences = text.split('.')
+        truncated_text = ""
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+                
+            if len(truncated_text + sentence + '.') <= max_length:
+                truncated_text += sentence + '. '
+            else:
+                break
+        
+        # If no complete sentences fit, just truncate
+        if not truncated_text.strip():
+            truncated_text = text[:max_length-3] + "..."
+        
+        return truncated_text.strip()
+
 
 class GenerationService:
     """Service for generating text completions using OpenRouter API"""
     def __init__(self):
         self.api_key = os.getenv("OPENROUTER_API_KEY")
-        self.model_name = os.getenv("GENERATION_MODEL", "qwen/qwen3-8b")  
+        self.model_name = os.getenv("GENERATIVE_MODEL", "qwen/qwen-2.5-72b-instruct")  
         self.base_url = "https://openrouter.ai/api/v1"
         if not self.api_key:
             raise ValueError("OPENROUTER_API_KEY is required in .env")
@@ -112,11 +227,10 @@ class GenerationService:
         # Clean the answer
         cleaned = answer.strip()
         
-        # Remove any unwanted prefixes that the model might add
+        # Remove any unwanted prefixes that the model might add  
         unwanted_prefixes = [
-            "Based on the context,", "According to the document,", 
-            "The document states that", "From the context provided,",
-            "Answer:", "Response:"
+            "Answer:", "Response:", "Based on the document context provided below,",
+            "Document Context:", "Question:"
         ]
         
         for prefix in unwanted_prefixes:
@@ -155,7 +269,7 @@ class GenerationService:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a precise document analyzer. Provide short, accurate answers based strictly on the given context. Never add information not explicitly stated in the document."
+                    "content": "You are a helpful AI assistant that answers questions based on document context. Extract relevant information directly from the provided context to answer questions concisely."
                 },
                 {
                     "role": "user",
@@ -189,20 +303,14 @@ class GenerationService:
 
     def _create_prompt(self, question: str, context: str) -> str:
         """Create a well-structured prompt for the model"""
-        prompt = f"""You are an AI assistant that answers questions strictly based on the provided document context. Follow these rules:
+        prompt = f"""Based on the document context provided below, answer the question directly and concisely.
 
-1. Only use information explicitly stated in the context
-2. Keep answers short and concise (1-3 sentences maximum)
-3. Do not add any external knowledge or assumptions
-4. If the exact answer is not in the context, say "The document does not specify this information"
-5. Quote specific phrases from the document when possible
-
-Context:
+Document Context:
 {context}
 
 Question: {question}
 
-Provide a brief, direct answer based only on the document context:"""
+Answer: """
         return prompt
 
     def _clean_answer(self, answer: str) -> str:
