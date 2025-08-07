@@ -15,7 +15,6 @@ from datetime import datetime
 # Import LangChain components
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain.schema.runnable import RunnablePassthrough
@@ -28,6 +27,14 @@ from langchain_core.embeddings import Embeddings
 # Import for TF-IDF embeddings
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
+
+# Try to import FAISS, fallback to simple vector store if not available
+try:
+    from langchain_community.vectorstores import FAISS
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+    print("⚠️ FAISS not available, using simple vector store")
 
 # Simple TF-IDF Embeddings class - optimized for speed
 class TfidfEmbeddings(Embeddings):
@@ -77,6 +84,56 @@ class TfidfEmbeddings(Embeddings):
         
         tfidf_vector = self.vectorizer.transform([text])
         return tfidf_vector.toarray().flatten().tolist()
+
+# Simple Vector Store as fallback when FAISS is not available
+class SimpleVectorStore:
+    """Simple vector store using cosine similarity with TF-IDF embeddings"""
+    
+    def __init__(self, documents, embeddings):
+        self.documents = documents
+        self.embeddings = embeddings
+        self.doc_texts = [doc.page_content for doc in documents]
+        self.doc_vectors = embeddings.embed_documents(self.doc_texts)
+    
+    def similarity_search(self, query: str, k: int = 4):
+        """Search for similar documents using cosine similarity"""
+        query_vector = self.embeddings.embed_query(query)
+        similarities = []
+        
+        for i, doc_vector in enumerate(self.doc_vectors):
+            # Calculate cosine similarity
+            dot_product = np.dot(query_vector, doc_vector)
+            norm_query = np.linalg.norm(query_vector)
+            norm_doc = np.linalg.norm(doc_vector)
+            
+            if norm_query > 0 and norm_doc > 0:
+                similarity = dot_product / (norm_query * norm_doc)
+            else:
+                similarity = 0
+            
+            similarities.append((similarity, i))
+        
+        # Sort by similarity and return top k
+        similarities.sort(reverse=True)
+        return [self.documents[i] for _, i in similarities[:k]]
+    
+    def as_retriever(self, search_kwargs=None):
+        """Return a retriever interface"""
+        k = search_kwargs.get('k', 4) if search_kwargs else 4
+        return SimpleRetriever(self, k)
+
+class SimpleRetriever:
+    """Simple retriever interface for SimpleVectorStore"""
+    
+    def __init__(self, vectorstore, k=4):
+        self.vectorstore = vectorstore
+        self.k = k
+    
+    def get_relevant_documents(self, query: str):
+        return self.vectorstore.similarity_search(query, k=self.k)
+    
+    def __call__(self, query: str):
+        return self.get_relevant_documents(query)
 
 # --- Initial Setup & Global Objects ---
 load_dotenv()
@@ -260,7 +317,12 @@ def run_hackrx_job(
             
             def create_embeddings():
                 try:
-                    vectorstore = FAISS.from_documents(chunks, embeddings)
+                    if FAISS_AVAILABLE:
+                        vectorstore = FAISS.from_documents(chunks, embeddings)
+                        print("✅ Using FAISS vector store")
+                    else:
+                        vectorstore = SimpleVectorStore(chunks, embeddings)
+                        print("✅ Using simple vector store (FAISS fallback)")
                     embedding_result["vectorstore"] = vectorstore
                 except Exception as e:
                     embedding_result["error"] = e
@@ -329,8 +391,15 @@ Answer: {answer}
 
         bm25_retriever = BM25Retriever.from_documents(chunks)
         bm25_retriever.k = 15  # Reduced from 25
-        faiss_retriever = vectorstore.as_retriever(search_kwargs={"k": 15})  # Reduced from 25
-        ensemble_retriever = EnsembleRetriever(retrievers=[bm25_retriever, faiss_retriever], weights=[0.7, 0.3])
+        
+        # Create ensemble retriever with vector store
+        if FAISS_AVAILABLE:
+            faiss_retriever = vectorstore.as_retriever(search_kwargs={"k": 15})  # Reduced from 25
+            ensemble_retriever = EnsembleRetriever(retrievers=[bm25_retriever, faiss_retriever], weights=[0.7, 0.3])
+        else:
+            # Use simple vector store retriever
+            simple_retriever = vectorstore.as_retriever(search_kwargs={"k": 15})
+            ensemble_retriever = EnsembleRetriever(retrievers=[bm25_retriever, simple_retriever], weights=[0.7, 0.3])
         
         # --- EXECUTION LOGIC ---
         final_answers = {}
