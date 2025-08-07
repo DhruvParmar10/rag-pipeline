@@ -1,3 +1,4 @@
+gradio
 fastapi
 uvicorn
 python-dotenv
@@ -11,3 +12,4 @@ pymupdf
 scikit-learn
 numpy
 rank_bm25
+faiss-cpu
