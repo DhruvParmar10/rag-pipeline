@@ -114,7 +114,7 @@ app = FastAPI(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 router = APIRouter(prefix="/api/v1")
 security = HTTPBearer()
-API_KEY = os.getenv("BEARER_TOKEN")
+API_KEY = os.getenv("BEARER_TOKEN", "7c695e780a6ab6eacffab7c9326e5d8e472a634870a6365979c5671ad28f003c")
 
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)):
     if not credentials or credentials.credentials != API_KEY:
@@ -441,6 +441,9 @@ def get_system_stats():
     }
 
 app.include_router(router)
+
+# Export the app for Vercel (this is required)
+app = app
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
